@@ -1,3 +1,5 @@
+#!/usr/bin/env swipl -g main
+
 :- use_module(library(clpfd)).
 :- use_module(library(csv)).
 
@@ -12,8 +14,7 @@ schedule(S) :-
 	(nonvar(S) -> sort(S, Schedule) ; S = Schedule),
 	findall(stand(ID, _), yield(ID,_,_,_,_), Schedule),
 	findall(edge(A,B), edge(A,B), Edges),
-	schedule_(Schedule, Edges),
-	label_schedule(Schedule).
+	schedule_(Schedule, Edges).
 
 schedule_(_, []).
 schedule_(Schedule, [edge(A,B)|Edges]) :-
@@ -68,18 +69,22 @@ error_([stand(ID, 3)|Stands], Target, Error, T1, T2, T3) :-
 	error_(Stands, Target, Error, T1, T2, NextT3).
 
 
-%% mutate(+Energy, +Base, -NewSchedule)
+%% mutate(+MutationRate, +Base, -NewSchedule)
 %
 
-mutate(0, S, S) :- !.
+mutate(Rate, Base, New) :-
+	length(Base, L),
+	N is round(L * Rate),
+	mutate_(N, Base, New),
+	label_schedule(New).
 
-mutate(N, Base, New) :-
-	random_select(stand(ID, Time), Base, Rest),
-	between(0, 3, NewTime),
-	NewTime \= Time,
+mutate_(0, S, S) :- !.
+
+mutate_(N, [stand(ID,Time)|Base], [stand(ID,NewTime)|New]) :-
+	NewTime in 0..3,
+	Time #\= NewTime,
 	N0 is N - 1,
-	mutate(N0, [stand(ID, NewTime)|Rest], New).
-
+	mutate_(N0, Base, New).
 
 
 %% conflict(+Schedule, ?ID, ?ConflictID)
@@ -91,115 +96,100 @@ conflict(S, ID, ConflictID) :-
 	member(stand(ConflictID, Time), Rest).
 
 
-%% all_conflicts(+Schedule, -Conflicts)
-% Conflicts is a list of stand IDs which are in conflict, sorted by the number
-% of conflicts per ID in descending order.
+%% conflict_count(+Schedule, +Stand, -Count)
+%
 
-all_conflicts(S, Conflicts) :-
-
-	% Collect the IDs of all stands in conflict
-	findall(ID, (
-		conflict(S, ID, _),
-		atom_concat(conflict_count, ID, Key),
-		flag(Key, N, N+1)
-	), Unsorted_Uncounted_WithDups),
-
-	% Remove dups
-	sort(Unsorted_Uncounted_WithDups, Unsorted_Uncounted),
-
-	% Collect [Count, ID] pairs
-	% Count is the number of conflicts involving ID
-	findall([Count, ID], (
-		member(ID, Unsorted_Uncounted),
-		member(stand(ID, _), S),
-		atom_concat(conflict_count, ID, Key),
-		flag(Key, Count, 0)
-	), Compound_Unsorted),
-
-	% Sort by most conflicts first
-	sort(Compound_Unsorted, Compound_LeastConflictsFirst),
-	reverse(Compound_LeastConflictsFirst, Compound_MostConflictsFirst),
-
-	% Simplify the list of pairs to the list of IDs, maintaining order
-	findall(ID, member([_, ID], Compound_MostConflictsFirst), Conflicts).
+conflict_count(S, stand(ID,Time), Count) :-
+	member(stand(ID, Time), S),
+	findall(ConflictID, (
+		edge(ID, ConflictID),
+		member(stand(ConflictID, Time), S)
+	), Conflicts),
+	length(Conflicts, Count).
 
 
 %% repair(+Broken, -Fixed)
 %
 
 repair(Broken, Fixed) :-
-	all_conflicts(Broken, Conflicts),
+	mergesort(Broken, descending(conflict_count(Broken)), Conflicts),
 	repair(Conflicts, Broken, Fixed).
+
 
 %% repair(+Queue, +Broken, -Fixed)
 %
 
-% The base case is that Broken is a partial assignment that can be made valid.
-% If so, we want to cut everything except the schedule assignments. To make
-% sure we only cut when a fix is possible, we first check that a valid binding
-% is possible on a copy, then cut *before* we try to bind the original.
 repair(_, Fixed, Fixed) :-
-	copy_term(Fixed, Copy),
-	schedule(Copy),
-	!,
-	schedule(Fixed).
+	schedule(Fixed),
+	!.
 
-% Otherwise, we change the time corresponding to the first ID in the queue into
-% a variable, and try again
-repair([ID|Queue], Broken, Fixed) :-
+repair([stand(ID, _)|Queue], Broken, Fixed) :-
 	select(stand(ID, _), Broken, Rest),
 	Next = [stand(ID, _) | Rest],
 	repair(Queue, Next, Fixed).
 
 
-%% test
+%% shuffle(+In, -Out)
 %
 
-test :-
+shuffle([], []) :- !.
+shuffle(In, [X|Out]) :-
+	random_select(X, In, Rest),
+	shuffle(Rest, Out).
+
+
+%% move(+MutationRate, +Base, -Move)
+%
+
+move(BeamSize, MutationRate, Base, BestMove) :-
 	target(T),
-	schedule(S),
-	findall(Mutant, mutate(5, S, Mutant), Mutants),
-	mergesort(Mutants, ascending(error(T)), [Best|_]),
-
-	error(T, Best, ErrorBefore),
-	debug(test, "Before fix: ~w", [ErrorBefore]),
-	!,
-
-	repair(Best, Fixed),
-	error(T, Fixed, ErrorAfter),
-	debug(test, "After fix: ~w", [ErrorAfter]).
+	shuffle(Base, Shuffled),
+	findnsols(BeamSize, M, mutate(MutationRate, Shuffled, M), Mutants),
+	mergesort(Mutants, ascending(error(T)), [BestInvalid|_]),
+	repair(BestInvalid, Partial),
+	findnsols(BeamSize, Partial, label_schedule(Partial), Moves),
+	mergesort(Moves, ascending(error(T)), [BestMove|_]).
 
 
 %% main
 %
 
 :- dynamic best/2.
-best(1000000000, _).
 
 main :-
 
-	Energy = 5,
+	% Disable multithreaded mergesort. Seems broken in SWI 7.1.23.
+	% debug(mergesort),
 
-	once(schedule(S)),
-	main(0, S, Energy).
+	% Parameters:
+	BeamSize = 512,
+	MutationRate = 0.1,
 
-main(I, BaseSchedule, Energy) :-
+	% Reset the best known solution
+	retractall(best(_,_)),
+	assert(best(infinity, _)),
+
+	% Get the party started
+	schedule(S),
+	once(label_schedule(S)),
+	main(BeamSize, MutationRate, 0, S).
+
+main(BeamSize, MutationRate, I, Base) :-
 	target(T),
-	findall(Mutant, mutate(Energy, BaseSchedule, Mutant), Mutants),
-	mergesort(Mutants, ascending(error(T)), [BestInvalid|_]),
-	findall(Fix, repair(BestInvalid, Fix), Fixes),
-	mergesort(Fixes, ascending(error(T)), [BestValid|_]),
-	error(T, BestValid, Error),
+	move(BeamSize, MutationRate, Base, Next),
 
+	% Print only if we find something better
+	error(T, Next, Error),
 	(
 		best(OldBestError, _),
-		Error < OldBestError,
-		format("~w,~w,~w\n", [I, Error, BestValid]),
+		once((OldBestError = infinity ; Error < OldBestError)),
+		format("~w,~w,~w\n", [I, Error, Next]),
 		retractall(best(_,_)),
-		assert(best(Error, BestValid))
+		assert(best(Error, Next))
 	;
 		true
 	),
 
 	I1 is I + 1,
-	main(I1, BestValid, Energy).
+	!,
+	main(BeamSize, MutationRate, I1, Next).
